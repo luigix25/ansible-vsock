@@ -56,7 +56,7 @@ readonly TEST_NAMES=(
 	vm_client_host_server
 	vm_loopback
 	ns_host_vsock_ns_mode_ok
-	ns_host_vsock_ns_mode_write_once_ok
+	ns_host_vsock_child_ns_mode_ok
 	ns_global_same_cid_fails
 	ns_local_same_cid_ok
 	ns_global_local_same_cid_ok
@@ -74,9 +74,6 @@ readonly TEST_NAMES=(
 	ns_same_local_loopback_ok
 	ns_same_local_host_connect_to_local_vm_ok
 	ns_same_local_vm_connect_to_local_host_ok
-	ns_mode_change_connection_continue_vm_ok
-	ns_mode_change_connection_continue_host_ok
-	ns_mode_change_connection_continue_both_ok
 	ns_delete_vm_ok
 	ns_delete_host_ok
 	ns_delete_both_ok
@@ -94,8 +91,8 @@ readonly TEST_DESCS=(
 	# ns_host_vsock_ns_mode_ok
 	"Check /proc/sys/net/vsock/ns_mode strings on the host."
 
-	# ns_host_vsock_ns_mode_write_once_ok
-	"Check /proc/sys/net/vsock/ns_mode is write-once on the host."
+	# ns_host_vsock_child_ns_mode_ok
+	"Check /proc/sys/net/vsock/ns_mode is read-only and child_ns_mode is writable."
 
 	# ns_global_same_cid_fails
 	"Check QEMU fails to start two VMs with same CID in two different global namespaces."
@@ -147,15 +144,6 @@ readonly TEST_DESCS=(
 
 	# ns_same_local_vm_connect_to_local_host_ok
 	"Run vsock_test client in VM in a local ns with server in same ns."
-
-	# ns_mode_change_connection_continue_vm_ok
-	"Check that changing NS mode of VM namespace from global to local after a connection is established doesn't break the connection"
-
-	# ns_mode_change_connection_continue_host_ok
-	"Check that changing NS mode of host namespace from global to local after a connection is established doesn't break the connection"
-
-	# ns_mode_change_connection_continue_both_ok
-	"Check that changing NS mode of host and VM namespaces from global to local after a connection is established doesn't break the connection"
 
 	# ns_delete_vm_ok
 	"Check that deleting the VM's namespace does not break the socket connection"
@@ -228,21 +216,20 @@ check_result() {
 }
 
 add_namespaces() {
-	# add namespaces local0, local1, global0, and global1
+	local orig_mode
+	orig_mode=$(cat /proc/sys/net/vsock/child_ns_mode)
+
 	for mode in "${NS_MODES[@]}"; do
+		echo "${mode}" > /proc/sys/net/vsock/child_ns_mode
 		ip netns add "${mode}0" 2>/dev/null
 		ip netns add "${mode}1" 2>/dev/null
 	done
+
+	echo "${orig_mode}" > /proc/sys/net/vsock/child_ns_mode
 }
 
 init_namespaces() {
 	for mode in "${NS_MODES[@]}"; do
-		ns_set_mode "${mode}0" "${mode}"
-		ns_set_mode "${mode}1" "${mode}"
-
-		log_host "set ns ${mode}0 to mode ${mode}"
-		log_host "set ns ${mode}1 to mode ${mode}"
-
 		# we need lo for qemu port forwarding
 		ip netns exec "${mode}0" ip link set dev lo up
 		ip netns exec "${mode}1" ip link set dev lo up
@@ -256,14 +243,6 @@ del_namespaces() {
 		log_host "removed ns ${mode}0"
 		log_host "removed ns ${mode}1"
 	done
-}
-
-ns_set_mode() {
-	local ns=$1
-	local mode=$2
-
-	echo "${mode}" | ip netns exec "${ns}" \
-		tee /proc/sys/net/vsock/ns_mode &>/dev/null
 }
 
 vm_ssh() {
@@ -713,9 +692,19 @@ log_guest() {
 	LOG_PREFIX=guest log "$@"
 }
 
+ns_get_mode() {
+	local ns=$1
+
+	ip netns exec "${ns}" cat /proc/sys/net/vsock/ns_mode 2>/dev/null
+}
+
 test_ns_host_vsock_ns_mode_ok() {
 	for mode in "${NS_MODES[@]}"; do
-		if ! ns_set_mode "${mode}0" "${mode}"; then
+		local actual
+
+		actual=$(ns_get_mode "${mode}0")
+		if [[ "${actual}" != "${mode}" ]]; then
+			log_host "expected mode ${mode}, got ${actual}"
 			return "${KSFT_FAIL}"
 		fi
 	done
@@ -1247,20 +1236,32 @@ test_ns_local_same_cid_ok() {
 	return "${KSFT_FAIL}"
 }
 
-test_ns_host_vsock_ns_mode_write_once_ok() {
+test_ns_host_vsock_child_ns_mode_ok() {
+	local orig_mode
+	local rc
+
+	orig_mode=$(cat /proc/sys/net/vsock/child_ns_mode)
+
+	rc="${KSFT_PASS}"
 	for mode in "${NS_MODES[@]}"; do
 		local ns="${mode}0"
-		if ! ns_set_mode "${ns}" "${mode}"; then
-			return "${KSFT_FAIL}"
+
+		if echo "${mode}" 2>/dev/null > /proc/sys/net/vsock/ns_mode; then
+			log_host "ns_mode should be read-only but write succeeded"
+			rc="${KSFT_FAIL}"
+			continue
 		fi
 
-		# try writing again and expect failure
-		if ns_set_mode "${ns}" "${mode}"; then
-			return "${KSFT_FAIL}"
+		if ! echo "${mode}" > /proc/sys/net/vsock/child_ns_mode; then
+			log_host "child_ns_mode should be writable to ${mode}"
+			rc="${KSFT_FAIL}"
+			continue
 		fi
 	done
 
-	return "${KSFT_PASS}"
+	echo "${orig_mode}" > /proc/sys/net/vsock/child_ns_mode
+
+	return "${rc}"
 }
 
 test_vm_server_host_client() {
@@ -1304,7 +1305,7 @@ test_vm_loopback() {
 	return "${KSFT_PASS}"
 }
 
-check_ns_changes_dont_break_connection() {
+check_ns_delete_doesnt_break_connection() {
 	local pipefile pidfile outfile
 	local ns0="global0"
 	local ns1="global1"
@@ -1337,24 +1338,13 @@ check_ns_changes_dont_break_connection() {
 	timeout "${WAIT_PERIOD}" \
 		bash -c 'while [[ ! -e '"${pipefile}"' ]]; do sleep 1; done; exit 0'
 
-	if [[ $2 == "delete" ]]; then
-		if [[ "$1" == "vm" ]]; then
-			ip netns del "${ns0}"
-		elif [[ "$1" == "host" ]]; then
-			ip netns del "${ns1}"
-		elif [[ "$1" == "both" ]]; then
-			ip netns del "${ns0}"
-			ip netns del "${ns1}"
-		fi
-	elif [[ $2 == "change_mode" ]]; then
-		if [[ "$1" == "vm" ]]; then
-			ns_set_mode "${ns0}" "local"
-		elif [[ "$1" == "host" ]]; then
-			ns_set_mode "${ns1}" "local"
-		elif [[ "$1" == "both" ]]; then
-			ns_set_mode "${ns0}" "local"
-			ns_set_mode "${ns1}" "local"
-		fi
+	if [[ "$1" == "vm" ]]; then
+		ip netns del "${ns0}"
+	elif [[ "$1" == "host" ]]; then
+		ip netns del "${ns1}"
+	elif [[ "$1" == "both" ]]; then
+		ip netns del "${ns0}"
+		ip netns del "${ns1}"
 	fi
 
 	echo "TEST" > "${pipefile}"
@@ -1375,28 +1365,16 @@ check_ns_changes_dont_break_connection() {
 	return "${rc}"
 }
 
-test_ns_mode_change_connection_continue_vm_ok() {
-	check_ns_changes_dont_break_connection "vm" "change_mode"
-}
-
-test_ns_mode_change_connection_continue_host_ok() {
-	check_ns_changes_dont_break_connection "host" "change_mode"
-}
-
-test_ns_mode_change_connection_continue_both_ok() {
-	check_ns_changes_dont_break_connection "both" "change_mode"
-}
-
 test_ns_delete_vm_ok() {
-	check_ns_changes_dont_break_connection "vm" "delete"
+	check_ns_delete_doesnt_break_connection "vm"
 }
 
 test_ns_delete_host_ok() {
-	check_ns_changes_dont_break_connection "host" "delete"
+	check_ns_delete_doesnt_break_connection "host"
 }
 
 test_ns_delete_both_ok() {
-	check_ns_changes_dont_break_connection "both" "delete"
+	check_ns_delete_doesnt_break_connection "both"
 }
 
 shared_vm_test() {

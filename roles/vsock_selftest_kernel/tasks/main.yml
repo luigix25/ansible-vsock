@@ -12,6 +12,23 @@
     mode: 0777
     force: no
 
+- name: Generate an OpenSSH keypair needed by vmtest
+  community.crypto.openssh_keypair:
+    path: /root/.ssh/id_rsa
+
+- name: Set authorized key
+  shell: "cat /root/.ssh/id_rsa >> /root/.ssh/authorized_keys"
+
+- name: Disable key checking
+  shell: |
+    printf "Host *\n    StrictHostKeyChecking no\n" >> /root/.ssh/config
+
+#- name: Set authorized key
+#  ansible.posix.authorized_key:
+#    user: root
+#    state: present
+#    key: "{{ lookup('file', '/root/.ssh/id_rsa.pub') }}"
+
 - name: Start vmtest
   shell: "/tmp/vmtest.sh"
   register: vmtest_ret
