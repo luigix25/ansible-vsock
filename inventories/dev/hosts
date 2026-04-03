@@ -1,5 +1,5 @@
 [local]
-localhost ansible_connection=ssh
+localhost ansible_connection=ssh ansible_python_interpreter=/usr/bin/python3
 
 vsockvm0 ansible_user=root
 vsockvm1 ansible_user=root
